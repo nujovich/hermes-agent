@@ -1,0 +1,49 @@
+name: a2a-platform
+label: A2A (Agent-to-Agent)
+kind: platform
+version: 1.0.0
+description: >
+  Google Agent-to-Agent (A2A) protocol adapter for Hermes Agent.
+  Exposes Hermes as an A2A-compatible agent server, enabling other
+  A2A agents and orchestrators to discover and invoke Hermes via
+  the standard JSON-RPC 2.0 task protocol.  Supports synchronous
+  task execution and SSE streaming responses.
+author: NousResearch
+requires_env:
+  - name: A2A_HOST
+    description: "Host address for the A2A server (default: 127.0.0.1)"
+    prompt: "A2A server host"
+    password: false
+  - name: A2A_PORT
+    description: "Port for the A2A server (default: 10000)"
+    prompt: "A2A server port"
+    password: false
+optional_env:
+  - name: A2A_API_KEY
+    description: "Bearer token required to authenticate A2A requests (leave empty for no auth)"
+    prompt: "A2A API key (optional)"
+    password: true
+  - name: A2A_ALLOWED_USERS
+    description: "Comma-separated caller IDs allowed to submit tasks (empty = allow all)"
+    prompt: "Allowed callers (comma-separated)"
+    password: false
+  - name: A2A_ALLOW_ALL_USERS
+    description: "Allow any caller to submit tasks (dev only)"
+    prompt: "Allow all callers? (true/false)"
+    password: false
+  - name: A2A_HOME_CHANNEL
+    description: "Default task ID for cron / notification delivery"
+    prompt: "Home task ID (or empty)"
+    password: false
+  - name: A2A_AGENT_NAME
+    description: "Agent name advertised in the Agent Card (default: Hermes Agent)"
+    prompt: "Agent name"
+    password: false
+  - name: A2A_AGENT_DESCRIPTION
+    description: "Agent description in the Agent Card"
+    prompt: "Agent description"
+    password: false
+  - name: A2A_PUBLIC_URL
+    description: "Public URL at which this agent is reachable (used in Agent Card)"
+    prompt: "Public URL (e.g. https://agent.example.com)"
+    password: false

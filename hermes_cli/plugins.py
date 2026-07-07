@@ -217,9 +217,11 @@ VALID_HOOKS: Set[str] = {
     # Only "status" is required; "message" is the plugin-authored notice the
     # core surfaces; all other keys (scope/scope_id/window/spent/limit/pct/
     # based_on_estimates/degraded) are metadata the core does not act on.
-    # In PR1 the core dispatches this once per turn and injects a soft/hard
-    # notice into the user message (never the system prompt). The real
-    # pre-LLM hard-abort is a later change. See get_budget_check_verdict.
+    # The core dispatches this once per turn in the prologue (soft/advisory
+    # notice folded into the user message, never the system prompt) AND per
+    # iteration in the conversation loop, where a "hard" verdict aborts the
+    # turn before the billable API call (agent.budget_enforcement, default on).
+    # See get_budget_check_verdict.
     "on_budget_check",
 }
 

@@ -515,6 +515,25 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     return sp
 
 
+def _budget_enforcement_enabled() -> bool:
+    """Master enable for the pre-LLM budget hard gate (agent.budget_enforcement).
+
+    Defaults to True and fails open: a config-read error must never silently
+    disable enforcement, since the whole point of the gate is to honor the
+    operator's explicit spend intent.
+    """
+    try:
+        from hermes_cli.config import cfg_get, load_config_readonly
+
+        # Read-only, hot-loop path: load_config_readonly() skips the defensive
+        # deepcopy that load_config() performs on every call.
+        return bool(
+            cfg_get(load_config_readonly(), "agent", "budget_enforcement", default=True)
+        )
+    except Exception:
+        return True
+
+
 def run_conversation(
     agent,
     user_message: str,
@@ -655,6 +674,53 @@ def run_conversation(
             _turn_exit_reason = "budget_exhausted"
             if not agent.quiet_mode:
                 agent._safe_print(f"\n⚠️  Iteration budget exhausted ({agent.iteration_budget.used}/{agent.iteration_budget.max_total} iterations used)")
+            break
+
+        # Plugin hook: on_budget_check pre-LLM HARD gate (issue #52648).
+        # Dispatched per iteration — cost accrues mid-turn, so a hard breach
+        # can surface at iteration N of a multi-call turn. On "hard" we abort
+        # the turn HERE, before ANY billable work for this iteration (MoA
+        # reference/aggregator calls AND the main API call), so no in-flight
+        # bill is incurred — the legacy pre_tool_call tool-gate blocked one
+        # call too late (the LLM response was already billed). Placed before
+        # message assembly so an aborted iteration also skips that wasted work.
+        # Soft/advisory notices ride the turn prologue (agent/turn_context.py);
+        # this gate acts on "hard" only. Master-gated by
+        # agent.budget_enforcement (default on); short-circuits cheaply when no
+        # plugin registers the hook.
+        _budget_verdict = None
+        try:
+            from hermes_cli.plugins import get_budget_check_verdict, has_hook
+
+            if has_hook("on_budget_check") and _budget_enforcement_enabled():
+                _budget_verdict = get_budget_check_verdict(
+                    session_id=agent.session_id or "",
+                    task_id=effective_task_id,
+                    turn_id=turn_id,
+                    platform=agent.platform or "",
+                    sender_id=getattr(agent, "_user_id", None) or "",
+                    model=agent.model,
+                )
+        except Exception as _budget_exc:
+            logger.warning("on_budget_check hard gate failed: %s", _budget_exc)
+        if isinstance(_budget_verdict, dict) and _budget_verdict.get("status") == "hard":
+            _budget_msg = _budget_verdict.get("message")
+            final_response = (
+                _budget_msg
+                if isinstance(_budget_msg, str) and _budget_msg.strip()
+                else "Budget limit reached — stopping before the next model call."
+            )
+            _turn_exit_reason = "budget_hard_block"
+            messages.append({"role": "assistant", "content": final_response})
+            agent._emit_status(
+                "🛑 Budget limit reached — stopping before the API call"
+            )
+            api_call_count -= 1
+            agent._api_call_count = api_call_count
+            try:
+                agent.iteration_budget.refund()
+            except Exception:
+                pass
             break
 
         # Fire step_callback for gateway hooks (agent:step event)

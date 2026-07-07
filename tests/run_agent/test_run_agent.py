@@ -3913,6 +3913,36 @@ class TestHandleMaxIterations:
         assert tool_ids == ["call_good", "call_bad"]
 
 
+def test_budget_enforcement_enabled_default_true(monkeypatch):
+    """With no override, the pre-LLM budget gate is enabled."""
+    from agent import conversation_loop
+
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda *a, **k: {})
+    assert conversation_loop._budget_enforcement_enabled() is True
+
+
+def test_budget_enforcement_enabled_respects_config_off(monkeypatch):
+    """agent.budget_enforcement=False disables the gate."""
+    from agent import conversation_loop
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda *a, **k: {"agent": {"budget_enforcement": False}},
+    )
+    assert conversation_loop._budget_enforcement_enabled() is False
+
+
+def test_budget_enforcement_enabled_fails_open(monkeypatch):
+    """A config-read failure must not silently disable enforcement."""
+    from agent import conversation_loop
+
+    def _boom(*a, **k):
+        raise RuntimeError("config unavailable")
+
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", _boom)
+    assert conversation_loop._budget_enforcement_enabled() is True
+
+
 class TestRunConversation:
     """Tests for the main run_conversation method.
 
@@ -3965,6 +3995,207 @@ class TestRunConversation:
         assert not agent.client.chat.completions.create.called
         assert "Ollama runtime context too small for Hermes tool use" in caplog.text
         assert "runtime_context=4096" in caplog.text
+
+    def test_budget_hard_verdict_aborts_before_api_call(self, agent, monkeypatch):
+        """A hard on_budget_check verdict stops the turn BEFORE the billable
+        API call — no in-flight bill on a breach (issue #52648)."""
+        self._setup_agent(agent)
+        # If the gate is missing, this response would let the turn complete
+        # normally after a (billable) call — making the not-called assertion fail.
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="should never be produced", finish_reason="stop"
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.has_hook", lambda name: name == "on_budget_check"
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_budget_check_verdict",
+            lambda **kw: {
+                "status": "hard",
+                "message": "[BUDGET] Daily limit reached — stopping.",
+            },
+        )
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("do something expensive")
+
+        assert not agent.client.chat.completions.create.called
+        assert result["api_calls"] == 0
+        assert result["turn_exit_reason"] == "budget_hard_block"
+        assert "[BUDGET] Daily limit reached — stopping." in result["final_response"]
+
+    def test_budget_hard_verdict_uses_fallback_message_when_blank(self, agent, monkeypatch):
+        """A hard verdict with no message still aborts, using a default notice."""
+        self._setup_agent(agent)
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="x", finish_reason="stop"
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.has_hook", lambda name: name == "on_budget_check"
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_budget_check_verdict",
+            lambda **kw: {"status": "hard"},  # no "message" key
+        )
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("go")
+
+        assert not agent.client.chat.completions.create.called
+        assert result["turn_exit_reason"] == "budget_hard_block"
+        assert (
+            result["final_response"]
+            == "Budget limit reached — stopping before the next model call."
+        )
+
+    def test_budget_hard_block_is_not_failed_but_completed(self, agent, monkeypatch):
+        """A budget stop is an intentional operator stop, not an error: failed
+        stays False; the distinct signal is turn_exit_reason. (Deliberate — a
+        response IS delivered, so the turn is reported completed.)"""
+        self._setup_agent(agent)
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="x", finish_reason="stop"
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.has_hook", lambda name: name == "on_budget_check"
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_budget_check_verdict",
+            lambda **kw: {"status": "hard", "message": "[BUDGET] stop"},
+        )
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("go")
+
+        assert result["failed"] is False
+        assert result["completed"] is True
+        assert result["turn_exit_reason"] == "budget_hard_block"
+
+    def test_budget_hard_fires_before_moa_aggregation(self, agent, monkeypatch):
+        """On a MoA turn the gate must abort BEFORE aggregate_moa_context —
+        otherwise the reference/aggregator calls bill in-flight (issue #52648)."""
+        self._setup_agent(agent)
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="x", finish_reason="stop"
+        )
+        moa_spy = MagicMock(return_value="")
+        monkeypatch.setattr("agent.moa_loop.aggregate_moa_context", moa_spy)
+        monkeypatch.setattr(
+            "hermes_cli.plugins.has_hook", lambda name: name == "on_budget_check"
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_budget_check_verdict",
+            lambda **kw: {"status": "hard", "message": "[BUDGET] stop"},
+        )
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                "go",
+                moa_config={
+                    "reference_models": [{"model": "ref-1"}],
+                    "aggregator": {"model": "agg"},
+                },
+            )
+
+        assert not moa_spy.called
+        assert not agent.client.chat.completions.create.called
+        assert result["turn_exit_reason"] == "budget_hard_block"
+
+    def test_budget_soft_verdict_does_not_abort_turn(self, agent, monkeypatch):
+        """A soft verdict is advisory only — the gate must NOT block the call."""
+        self._setup_agent(agent)
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="Final answer", finish_reason="stop"
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.has_hook", lambda name: name == "on_budget_check"
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_budget_check_verdict",
+            lambda **kw: {"status": "soft", "message": "[BUDGET] Global at 82%"},
+        )
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert agent.client.chat.completions.create.called
+        assert result["turn_exit_reason"] != "budget_hard_block"
+        assert result["final_response"] == "Final answer"
+
+    def test_budget_hard_on_later_iteration_bills_only_prior_calls(self, agent, monkeypatch):
+        """Cost accrues mid-turn: the breach surfaces on iteration 2, after the
+        first call already billed. The gate aborts before the 2nd call, so
+        exactly one call bills and api_calls == 1."""
+        self._setup_agent(agent)
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
+        resp2 = _mock_response(content="Should not be reached", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [resp1, resp2]
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.has_hook", lambda name: name == "on_budget_check"
+        )
+        # Flip to hard only once the first call has actually billed.
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_budget_check_verdict",
+            lambda **kw: (
+                {"status": "hard", "message": "[BUDGET] mid-turn breach"}
+                if agent.client.chat.completions.create.call_count >= 1
+                else {"status": "ok"}
+            ),
+        )
+        with (
+            patch("run_agent.handle_function_call", return_value="search result"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("search something")
+
+        assert agent.client.chat.completions.create.call_count == 1
+        assert result["api_calls"] == 1
+        assert result["turn_exit_reason"] == "budget_hard_block"
+
+    def test_budget_gate_disabled_lets_hard_verdict_through(self, agent, monkeypatch):
+        """agent.budget_enforcement=False bypasses the gate even on a hard verdict."""
+        self._setup_agent(agent)
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="Final answer", finish_reason="stop"
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.has_hook", lambda name: name == "on_budget_check"
+        )
+        monkeypatch.setattr(
+            "agent.conversation_loop._budget_enforcement_enabled", lambda: False
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_budget_check_verdict",
+            lambda **kw: {"status": "hard", "message": "[BUDGET] stop"},
+        )
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert agent.client.chat.completions.create.called
+        assert result["turn_exit_reason"] != "budget_hard_block"
 
     def test_tool_calls_then_stop(self, agent):
         self._setup_agent(agent)

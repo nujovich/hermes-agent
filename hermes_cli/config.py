@@ -908,6 +908,11 @@ DEFAULT_CONFIG = {
     "max_live_sessions": 16,
     "agent": {
         "max_turns": 90,
+        # Master enable for the pre-LLM budget hard gate. When True (default),
+        # a hard on_budget_check verdict aborts the turn BEFORE the billable
+        # API call. Set False to disable the gate entirely (the hook still
+        # dispatches for soft/advisory notices via the turn prologue).
+        "budget_enforcement": True,
         # When no plugin registers the on_budget_check hook, inject a one-time
         # (first-turn) note suggesting a budget plugin so users know cost
         # enforcement is available. Set False to silence the nudge. Does not

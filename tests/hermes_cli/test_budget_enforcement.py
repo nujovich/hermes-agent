@@ -98,3 +98,10 @@ def test_budget_enforcement_hint_default_is_true():
     from hermes_cli.config import DEFAULT_CONFIG, cfg_get
 
     assert cfg_get(DEFAULT_CONFIG, "agent", "budget_enforcement_hint") is True
+
+
+def test_budget_enforcement_default_is_true():
+    """The pre-LLM hard gate (PR2) is on by default, overridable via config."""
+    from hermes_cli.config import DEFAULT_CONFIG, cfg_get
+
+    assert cfg_get(DEFAULT_CONFIG, "agent", "budget_enforcement") is True
